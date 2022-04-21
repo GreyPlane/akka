@@ -57,7 +57,7 @@ object StatefulMap {
             case _                          => (Some(elem), Some(elem))
           },
         _ => None)
-      .collect({ case Some(elem) => elem })
+      .collect { case Some(elem) => elem }
       .runWith(Sink.foreach(println))
     //prints
     //A
