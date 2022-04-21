@@ -44,8 +44,8 @@ Scala
 Java
 :   @@snip [StatefulMap.java](/akka-docs/src/test/java/jdocs/stream/operators/flow/StatefulMap.java) { #bufferUntilChanged }
 
-In this example, the elements are keep buffering until the element is changed, and then the buffer is emitted downstream.
-When upstream completed, we defer the completion and emit the ongoing buffer to downstream too.
+In this example, the elements are buffered until the incoming element is different, and then emitted dowsntream,
+When upstream completes, if there are buffered elements, it they are emitted before completing.
 
 In the third example we will distinguish between the continuing elements.
 
