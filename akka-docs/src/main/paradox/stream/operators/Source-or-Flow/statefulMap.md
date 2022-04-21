@@ -33,8 +33,8 @@ Scala
 Java
 :   @@snip [StatefulMap.java](/akka-docs/src/test/java/jdocs/stream/operators/flow/StatefulMap.java) { #indexed }
 
-In this example we implemented an `indexed` operator,it always associate a unique index 
-to each element of the stream, the index starts from 0.
+In this example we implement an `indexed` operator like @ref:[zipWithIndex](zipWithIndex.md), it always associates a unique index 
+with each element of the stream, the index starts from 0.
 
 In the second example we keep buffering until the element is changed.
 
