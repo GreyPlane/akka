@@ -55,7 +55,7 @@ Scala
 Java
 :   @@snip [StatefulMap.java](/akka-docs/src/test/java/jdocs/stream/operators/flow/StatefulMap.java) { #distinctUntilChanged }
 
-In this example, the elements duplicated with the previous one will be dropped.
+In this example, repeated incoming elements are only emitted once and then dropped.
 
 In the forth example we will use some kind of resource when handling the element,
 and do clean up when the stream is complete.
