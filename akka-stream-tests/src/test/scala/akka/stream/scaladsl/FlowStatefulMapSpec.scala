@@ -5,10 +5,13 @@
 package akka.stream.scaladsl
 
 import akka.Done
-import akka.stream.AbruptStageTerminationException
-import akka.stream.ActorAttributes
-import akka.stream.ActorMaterializer
-import akka.stream.Supervision
+import akka.stream.{
+  AbruptStageTerminationException,
+  ActorAttributes,
+  ActorMaterializer,
+  BoundedSourceQueue,
+  Supervision
+}
 import akka.stream.testkit.StreamSpec
 import akka.stream.testkit.TestSubscriber
 import akka.stream.testkit.scaladsl.TestSink
@@ -63,18 +66,43 @@ class FlowStatefulMapSpec extends StreamSpec {
     }
 
     "be able to resume" in {
-      val testSink = Source(List(1, 2, 3, 4, 5))
-        .statefulMap(() => 0)((agg, elem) => {
-          if (elem % 2 == 0)
-            throw ex
-          else
-            (agg + elem, (agg, elem))
-        }, _ => None)
-        .withAttributes(ActorAttributes.supervisionStrategy(Supervision.resumingDecider))
-        .runWith(TestSink.probe[(Int, Int)])
 
-      testSink.expectSubscription().request(5)
-      testSink.expectNext((0, 1)).expectNext((1, 3)).expectNext((4, 5)).expectComplete()
+      var qRef: BoundedSourceQueue[Int] = null
+//      val evilDecider: Supervision.Decider = {
+//        case _ => {
+//          println("i'm evil!")
+////          Thread.sleep(1000)
+////          qRef.complete()
+////          println("resumed")
+//          Supervision.Resume
+//        }
+//      }
+
+      def printThreadName(id: String) = println(s"${Thread.currentThread().getName}-$id")
+
+      implicit val ec = system.dispatcher
+
+      val (queue, _) = Source
+        .queue[Int](100)
+        .statefulMapAsync[Int, Int](1)(
+          () => Future { printThreadName("create"); 1 },
+          (s, e) => { Future { println(s"next state ${s+e}, $e") ; s + e -> e } },
+          s => Some(s),
+          (_, y) => y)
+//        .withAttributes(ActorAttributes.supervisionStrategy(evilDecider))
+        .toMat(Sink.foreach(println(_)))(Keep.both)
+        .run()
+
+      qRef = queue
+      queue.offer(1)
+      queue.offer(2)
+      queue.complete()
+
+      Thread.sleep(10000)
+
+//      testSink.expectNext((0, 1))
+      //      testSink.expectSubscription().request(5)
+//      testSink.expectNext((0, 1)).expectNext((1, 3)).expectNext((4, 5)).expectComplete()
     }
 
     "be able to restart" in {

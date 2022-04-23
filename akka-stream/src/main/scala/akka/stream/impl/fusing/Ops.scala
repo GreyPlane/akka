@@ -4,35 +4,32 @@
 
 package akka.stream.impl.fusing
 
-import java.util.concurrent.TimeUnit.NANOSECONDS
+import akka.actor.{ActorRef, Terminated}
+import akka.annotation.{DoNotInherit, InternalApi}
+import akka.event.Logging.LogLevel
+import akka.event._
+import akka.stream.ActorAttributes.SupervisionStrategy
+import akka.stream.Attributes.{InputBuffer, LogLevels, SourceLocation}
+import akka.stream.OverflowStrategies._
+import akka.stream.Supervision.Decider
+import akka.stream.impl.Stages.DefaultAttributes
+import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
+import akka.stream.impl.{ContextPropagation, ReactiveStreamsCompliance, Buffer => BufferImpl}
+import akka.stream.scaladsl.{DelayStrategy, Source}
+import akka.stream.stage._
+import akka.stream._
+import akka.util.ccompat._
+import akka.util.{OptionVal, unused}
 
-import scala.annotation.nowarn
-import scala.annotation.tailrec
+import java.util.concurrent.TimeUnit.NANOSECONDS
+import scala.annotation.{nowarn, tailrec}
 import scala.collection.immutable
 import scala.collection.immutable.VectorBuilder
 import scala.concurrent.Future
-import scala.concurrent.duration.{ FiniteDuration, _ }
-import scala.util.{ Failure, Success, Try }
-import scala.util.control.{ NoStackTrace, NonFatal }
+import scala.concurrent.duration.{FiniteDuration, _}
 import scala.util.control.Exception.Catcher
-
-import akka.actor.{ ActorRef, Terminated }
-import akka.annotation.{ DoNotInherit, InternalApi }
-import akka.event._
-import akka.event.Logging.LogLevel
-import akka.stream.{ Supervision, _ }
-import akka.stream.ActorAttributes.SupervisionStrategy
-import akka.stream.Attributes.{ InputBuffer, LogLevels }
-import akka.stream.Attributes.SourceLocation
-import akka.stream.OverflowStrategies._
-import akka.stream.Supervision.Decider
-import akka.stream.impl.{ ContextPropagation, ReactiveStreamsCompliance, Buffer => BufferImpl }
-import akka.stream.impl.Stages.DefaultAttributes
-import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
-import akka.stream.scaladsl.{ DelayStrategy, Source }
-import akka.stream.stage._
-import akka.util.{ unused, OptionVal }
-import akka.util.ccompat._
+import scala.util.control.{NoStackTrace, NonFatal}
+import scala.util.{Failure, Success, Try}
 
 /**
  * INTERNAL API
@@ -412,8 +409,8 @@ private[stream] object Collect {
       private var aggregator = zero
       private lazy val decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
 
-      import Supervision.{ Restart, Resume, Stop }
-      import shape.{ in, out }
+      import Supervision.{Restart, Resume, Stop}
+      import shape.{in, out}
 
       // Initial behavior makes sure that the zero gets flushed if upstream is empty
       setHandler(out, new OutHandler {
@@ -1237,6 +1234,101 @@ private[stream] object Collect {
 /**
  * INTERNAL API
  */
+@InternalApi
+private[akka] final class StatefulMap[S, In, Out](create: () => S, f: (S, In) => (S, Out), onComplete: S => Option[Out])
+    extends GraphStage[FlowShape[In, Out]] {
+  require(create != null, "create function should not be null")
+  require(f != null, "f function should not be null")
+  require(onComplete != null, "onComplete function should not be null")
+
+  private val in = Inlet[In]("StatefulMap.in")
+  private val out = Outlet[Out]("StatefulMap.out")
+  override val shape: FlowShape[In, Out] = FlowShape(in, out)
+
+  override protected def initialAttributes: Attributes = DefaultAttributes.statefulMap and SourceLocation.forLambda(f)
+
+  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+    new GraphStageLogic(shape) with InHandler with OutHandler {
+      lazy val decider: Decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
+
+      private var state: S = _
+      private var needInvokeOnCompleteCallback: Boolean = false
+
+      override def preStart(): Unit = {
+        state = create()
+        needInvokeOnCompleteCallback = true
+      }
+
+      override def onPush(): Unit =
+        try {
+          val elem = grab(in)
+          val (newState, newElem) = f(state, elem)
+          state = newState
+          push(out, newElem)
+        } catch {
+          case NonFatal(ex) =>
+            decider(ex) match {
+              case Supervision.Stop => closeStateAndFail(ex)
+              case Supervision.Resume => {
+                println(isClosed(in))
+                pull(in)
+              }
+              case Supervision.Restart => resetStateAndPull()
+            }
+        }
+
+      override def onUpstreamFinish(): Unit = closeStateAndComplete()
+
+      override def onUpstreamFailure(ex: Throwable): Unit = closeStateAndFail(ex)
+
+      override def onDownstreamFinish(cause: Throwable): Unit = {
+        onComplete(state)
+        needInvokeOnCompleteCallback = false
+        super.onDownstreamFinish(cause)
+      }
+
+      private def resetStateAndPull(): Unit = {
+        needInvokeOnCompleteCallback = false
+        onComplete(state)
+        state = create()
+        needInvokeOnCompleteCallback = true;
+        pull(in)
+      }
+
+      private def closeStateAndComplete(): Unit = {
+        println("complete")
+        onComplete(state) match {
+          case Some(elem) => emit(out, elem, () => completeStage())
+          case None       => completeStage()
+        }
+        needInvokeOnCompleteCallback = false
+      }
+
+      private def closeStateAndFail(ex: Throwable): Unit = {
+        onComplete(state) match {
+          case Some(elem) => emit(out, elem, () => failStage(ex))
+          case None       => failStage(ex)
+        }
+        needInvokeOnCompleteCallback = false
+      }
+
+      override def onPull(): Unit = pull(in)
+
+      override def postStop(): Unit = {
+        if (needInvokeOnCompleteCallback) {
+          onComplete(state)
+        }
+      }
+
+      setHandlers(in, out, this)
+    }
+
+  override def toString = "StatefulMap"
+}
+
+/**
+ * INTERNAL API
+ */
 @InternalApi private[akka] object MapAsync {
 
   final class Holder[T](var elem: Try[T], val cb: AsyncCallback[Holder[T]]) extends (Try[T] => Unit) {
@@ -1259,6 +1351,12 @@ private[stream] object Collect {
       elem = t
     }
 
+    def updateElemIfPresent(f: T => T): Unit = {
+      if (elem != null) {
+        elem = elem.map(f)
+      }
+    }
+
     override def apply(t: Try[T]): Unit = {
       setElem(t)
       cb.invoke(this)
@@ -1266,6 +1364,184 @@ private[stream] object Collect {
   }
 
   val NotYetThere = Failure(new Exception with NoStackTrace)
+}
+
+private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
+    create: () => Future[S],
+    f: (S, In) => Future[(S, Out)],
+    onComplete: S => Option[Out],
+    combineState: (S, S) => S)
+    extends GraphStage[FlowShape[In, Out]] {
+
+  import MapAsync._
+
+  private val in = Inlet[In]("StatefulMapAsync.in")
+  private val out = Outlet[Out]("StatefulMapAsync.out")
+
+  override def initialAttributes = DefaultAttributes.statefulMapAsync and SourceLocation.forLambda(f)
+
+  override val shape = FlowShape(in, out)
+
+  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
+    new GraphStageLogic(shape) with InHandler with OutHandler {
+
+      setHandlers(in, out, this)
+
+      lazy val decider: Decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
+
+      private val createCB = getAsyncCallback[Holder[S]](holder =>
+        holder.elem match {
+          case Success(_) => {
+//            stateAvailable = true
+            needInvokeOnCompleteCallback = true
+          }
+          case Failure(ex) => failStage(ex)
+        })
+      private val stateHolder: Holder[S] = new Holder(NotYetThere, createCB)
+      private var needInvokeOnCompleteCallback: Boolean = false
+//      private var stateAvailable = false
+      var buffer: BufferImpl[Holder[(S, Out)]] = _
+
+      private def releaseThenFailStage(ex: Throwable): Unit = {
+        stateHolder.elem match {
+          case Failure(_)     => failStage(ex)
+          case Success(state) => onComplete(state).foreach(e => emit(out, e, () => failStage(ex)))
+        }
+        needInvokeOnCompleteCallback = false
+      }
+
+      private def releaseThenCompleteStage(): Unit = {
+        stateHolder.elem match {
+          case Failure(ex)    => failStage(ex)
+          case Success(state) => onComplete(state).fold(completeStage())(e => emit(out, e, () => completeStage()))
+        }
+        needInvokeOnCompleteCallback = false
+      }
+
+      private def getIfValuePresentOrFailFast[T](future: Future[T], holder: Holder[T], onSuccess: () => Unit): Unit = {
+        future.value match {
+          case None    => future.onComplete(holder)(akka.dispatch.ExecutionContexts.parasitic)
+          case Some(v) =>
+            // #20217 the future is already here, optimization: avoid scheduling it on the dispatcher and
+            // run the logic directly on this thread
+            holder.setElem(v)
+            v match {
+              // this optimization also requires us to stop the stage to fail fast if the decider says so:
+              case Failure(ex) if holder.supervisionDirectiveFor(decider, ex) == Supervision.Stop =>
+                releaseThenFailStage(ex)
+              case _ => onSuccess()
+            }
+        }
+      }
+
+      private def resetStateAndPull(): Unit = {
+        needInvokeOnCompleteCallback = false
+        stateHolder.elem.foreach(onComplete)
+        getIfValuePresentOrFailFast(create(), stateHolder, () => {
+          needInvokeOnCompleteCallback = true
+          pullIfNeeded()
+        })
+      }
+
+      override def onUpstreamFinish(): Unit = {
+        println("ss")
+        releaseThenCompleteStage()
+      }
+
+      override def onUpstreamFailure(ex: Throwable): Unit = releaseThenFailStage(ex)
+
+      override def onDownstreamFinish(cause: Throwable): Unit = {
+        stateHolder.elem.foreach(onComplete)
+        needInvokeOnCompleteCallback = false
+        super.onDownstreamFinish(cause)
+      }
+
+      override def postStop(): Unit = {
+        if (needInvokeOnCompleteCallback) {
+          stateHolder.elem.foreach(onComplete)
+        }
+      }
+
+      override def preStart() = {
+        println("prestart")
+        val futureState = create()
+        getIfValuePresentOrFailFast(futureState, stateHolder, () => needInvokeOnCompleteCallback = true)
+        buffer = BufferImpl(parallelism, inheritedAttributes)
+      }
+
+      private val futureCB = getAsyncCallback[Holder[(S, Out)]](holder =>
+        holder.elem match {
+          case Success(_) => pushNextIfPossible()
+          case Failure(ex) =>
+            holder.supervisionDirectiveFor(decider, ex) match {
+              // fail fast as if supervision says so
+              case Supervision.Stop    => releaseThenFailStage(ex)
+              case Supervision.Restart => resetStateAndPull()
+              case Supervision.Resume  => pushNextIfPossible()
+            }
+        })
+
+      override def onPull(): Unit = pushNextIfPossible()
+
+      override def onPush(): Unit = {
+        stateHolder.elem match {
+          case Failure(ex) => releaseThenFailStage(ex)
+          case Success(state) => {
+            try {
+              val future = f(state, grab(in))
+              val holder = new Holder[(S, Out)](NotYetThere, futureCB)
+              buffer.enqueue(holder)
+              getIfValuePresentOrFailFast(future, holder, () => pushNextIfPossible())
+            } catch {
+              // this logic must only be executed if f throws, not if the future is failed
+              case NonFatal(ex) => if (decider(ex) == Supervision.Stop) releaseThenFailStage(ex)
+            }
+            pullIfNeeded()
+          }
+        }
+
+      }
+      @tailrec
+      private def pushNextIfPossible(): Unit =
+        if (buffer.isEmpty) pullIfNeeded()
+        else if (buffer.peek().elem eq NotYetThere) pullIfNeeded() // ahead of line blocking to keep order
+        else if (isAvailable(out)) {
+          val holder = buffer.dequeue()
+          holder.elem match {
+            case Success(elem) =>
+              if (elem != null) {
+                stateHolder.updateElemIfPresent(combineState(_, elem._1))
+                println(s"push ${elem._1}, ${stateHolder.elem}")
+                push(out, elem._2)
+                pullIfNeeded()
+              } else {
+                // elem is null
+                pullIfNeeded()
+                pushNextIfPossible()
+              }
+
+            case Failure(NonFatal(ex)) =>
+              holder.supervisionDirectiveFor(decider, ex) match {
+                // this could happen if we are looping in pushNextIfPossible and end up on a failed future before the
+                // onComplete callback has run
+                case Supervision.Stop => releaseThenFailStage(ex)
+                case _                =>
+                  // try next element
+                  pushNextIfPossible()
+              }
+            case Failure(ex) =>
+              // fatal exception in buffer, not sure that it can actually happen, but for good measure
+              throw ex
+          }
+        }
+
+      private def pullIfNeeded(): Unit = {
+        if (isClosed(in) && buffer.isEmpty) releaseThenCompleteStage()
+        else if (buffer.used < parallelism && !hasBeenPulled(in)) tryPull(in)
+        // else already pulled and waiting for next element
+      }
+
+    }
 }
 
 /**
@@ -2196,97 +2472,6 @@ private[stream] object Collect {
   }
 
   override def toString: String = "RecoverWith"
-}
-
-/**
- * INTERNAL API
- */
-@InternalApi
-private[akka] final class StatefulMap[S, In, Out](create: () => S, f: (S, In) => (S, Out), onComplete: S => Option[Out])
-    extends GraphStage[FlowShape[In, Out]] {
-  require(create != null, "create function should not be null")
-  require(f != null, "f function should not be null")
-  require(onComplete != null, "onComplete function should not be null")
-
-  private val in = Inlet[In]("StatefulMap.in")
-  private val out = Outlet[Out]("StatefulMap.out")
-  override val shape: FlowShape[In, Out] = FlowShape(in, out)
-
-  override protected def initialAttributes: Attributes = DefaultAttributes.statefulMap and SourceLocation.forLambda(f)
-
-  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic =
-    new GraphStageLogic(shape) with InHandler with OutHandler {
-      lazy val decider: Decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
-
-      private var state: S = _
-      private var needInvokeOnCompleteCallback: Boolean = false
-
-      override def preStart(): Unit = {
-        state = create()
-        needInvokeOnCompleteCallback = true
-      }
-
-      override def onPush(): Unit =
-        try {
-          val elem = grab(in)
-          val (newState, newElem) = f(state, elem)
-          state = newState
-          push(out, newElem)
-        } catch {
-          case NonFatal(ex) =>
-            decider(ex) match {
-              case Supervision.Stop    => closeStateAndFail(ex)
-              case Supervision.Resume  => pull(in)
-              case Supervision.Restart => resetStateAndPull()
-            }
-        }
-
-      override def onUpstreamFinish(): Unit = closeStateAndComplete()
-
-      override def onUpstreamFailure(ex: Throwable): Unit = closeStateAndFail(ex)
-
-      override def onDownstreamFinish(cause: Throwable): Unit = {
-        onComplete(state)
-        needInvokeOnCompleteCallback = false
-        super.onDownstreamFinish(cause)
-      }
-
-      private def resetStateAndPull(): Unit = {
-        needInvokeOnCompleteCallback = false
-        onComplete(state)
-        state = create()
-        needInvokeOnCompleteCallback = true;
-        pull(in)
-      }
-
-      private def closeStateAndComplete(): Unit = {
-        onComplete(state) match {
-          case Some(elem) => emit(out, elem, () => completeStage())
-          case None       => completeStage()
-        }
-        needInvokeOnCompleteCallback = false
-      }
-
-      private def closeStateAndFail(ex: Throwable): Unit = {
-        onComplete(state) match {
-          case Some(elem) => emit(out, elem, () => failStage(ex))
-          case None       => failStage(ex)
-        }
-        needInvokeOnCompleteCallback = false
-      }
-
-      override def onPull(): Unit = pull(in)
-
-      override def postStop(): Unit = {
-        if (needInvokeOnCompleteCallback) {
-          onComplete(state)
-        }
-      }
-
-      setHandlers(in, out, this)
-    }
-
-  override def toString = "StatefulMap"
 }
 
 /**

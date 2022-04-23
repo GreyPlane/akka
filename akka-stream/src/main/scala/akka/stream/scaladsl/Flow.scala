@@ -10,31 +10,20 @@ import scala.collection.immutable
 import scala.concurrent.Future
 import scala.concurrent.duration.FiniteDuration
 import scala.reflect.ClassTag
-
-import org.reactivestreams.{ Processor, Publisher, Subscriber, Subscription }
-
+import org.reactivestreams.{Processor, Publisher, Subscriber, Subscription}
 import akka.Done
 import akka.NotUsed
 import akka.actor.ActorRef
-import akka.annotation.{ ApiMayChange, DoNotInherit }
-import akka.event.{ LogMarker, LoggingAdapter, MarkerLoggingAdapter }
+import akka.annotation.{ApiMayChange, DoNotInherit}
+import akka.event.{LogMarker, LoggingAdapter, MarkerLoggingAdapter}
 import akka.stream._
 import akka.stream.Attributes.SourceLocation
-import akka.stream.impl.{
-  fusing,
-  LinearTraversalBuilder,
-  ProcessorModule,
-  SetupFlowStage,
-  SubFlowImpl,
-  Throttle,
-  Timers,
-  TraversalBuilder
-}
+import akka.stream.impl.{LinearTraversalBuilder, ProcessorModule, SetupFlowStage, SubFlowImpl, Throttle, Timers, TraversalBuilder, fusing}
 import akka.stream.impl.SingleConcat
 import akka.stream.impl.fusing._
 import akka.stream.impl.fusing.FlattenMerge
 import akka.stream.stage._
-import akka.util.{ ConstantFun, Timeout }
+import akka.util.{ConstantFun, Timeout}
 import akka.util.OptionVal
 import akka.util.ccompat._
 
@@ -1086,6 +1075,16 @@ trait FlowOps[+Out, +Mat] {
     if (parallelism == 1) mapAsyncUnordered[T](parallelism = 1)(f) // optimization for parallelism 1
     else via(MapAsync(parallelism, f))
 
+  def statefulMapAsync[S,T](parallelism: Int)(
+    create: () => Future[S],
+    f: (S, Out) => Future[(S, T)],
+    onComplete: S => Option[T],
+    combineState: (S, S) => S): Repr[T] = via(StatefulMapAsync(parallelism)(create, f, onComplete, combineState))
+
+
+//  def statefulMapAsync[S, T, U](parallelism: Int)
+//                         (create: () => Future[S], f: (S, T) => Future[(S, U)], release: S => Option[Future[Unit]]) =
+//    via(MapAsync(1, _ => create()))
   /**
    * Transform this stream by applying the given function to each of the elements
    * as they pass through this processing step. The function returns a `Future` and the
