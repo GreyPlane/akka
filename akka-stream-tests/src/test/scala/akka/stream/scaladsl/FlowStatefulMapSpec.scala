@@ -5,13 +5,7 @@
 package akka.stream.scaladsl
 
 import akka.Done
-import akka.stream.{
-  AbruptStageTerminationException,
-  ActorAttributes,
-  ActorMaterializer,
-  BoundedSourceQueue,
-  Supervision
-}
+import akka.stream.{ AbruptStageTerminationException, ActorAttributes, ActorMaterializer, Supervision }
 import akka.stream.testkit.StreamSpec
 import akka.stream.testkit.TestSubscriber
 import akka.stream.testkit.scaladsl.TestSink
@@ -64,45 +58,56 @@ class FlowStatefulMapSpec extends StreamSpec {
       sinkProb.expectSubscription().request(2)
       sinkProb.expectNext(List(1, 2, 3)).expectNext(List(4, 5)).expectComplete()
     }
+    def printThreadName(id: String) = println(s"${Thread.currentThread().getName}-$id")
 
-    "be able to resume" in {
-
-      var qRef: BoundedSourceQueue[Int] = null
-//      val evilDecider: Supervision.Decider = {
-//        case _ => {
-//          println("i'm evil!")
-////          Thread.sleep(1000)
-////          qRef.complete()
-////          println("resumed")
-//          Supervision.Resume
-//        }
-//      }
-
-      def printThreadName(id: String) = println(s"${Thread.currentThread().getName}-$id")
+    "optimized version" in {
+      // this version is deterministic bcs element is evaluated immediately without async boundary
+      // it's work like synchronous, so state are updated every time f be evaluated
 
       implicit val ec = system.dispatcher
 
-      val (queue, _) = Source
-        .queue[Int](100)
-        .statefulMapAsync[Int, Int](1)(
-          () => Future { printThreadName("create"); 1 },
-          (s, e) => { Future { println(s"next state ${s+e}, $e") ; s + e -> e } },
-          s => Some(s),
-          (_, y) => y)
-//        .withAttributes(ActorAttributes.supervisionStrategy(evilDecider))
-        .toMat(Sink.foreach(println(_)))(Keep.both)
-        .run()
+      val probe = Source(Range(1, 3))
+        .statefulMapAsync[Int, String](2)(() => Future { printThreadName("create"); 1 }, (s, e) => {
+          Future.successful(s -> s"$e element")
+        }, s => {
+          Some(s"$s state")
+        }, (x, y) => x + y)
+        .runWith(TestSink.probe)
 
-      qRef = queue
-      queue.offer(1)
-      queue.offer(2)
-      queue.complete()
+      val sub = probe.expectSubscription()
+      sub.request(1)
+      probe.expectNext("1 element")
+      sub.request(1)
+      probe.expectNext("2 element")
+      sub.request(1)
+      probe.expectNext("4 state")
+      probe.expectComplete()
+    }
 
-      Thread.sleep(10000)
+    "unoptimized version" in {
+      // this version is nondeterministic bcs f will be executed parallel
+      // the state's updating may or may not be presented when f be called
+      // if we change parallelism to 1, we got deterministic sequential behavior
+      // if we remove the optimization, we got nondeterministic but consistent(always work in async boundary) behavior
+      implicit val ec = system.dispatcher
 
-//      testSink.expectNext((0, 1))
-      //      testSink.expectSubscription().request(5)
-//      testSink.expectNext((0, 1)).expectNext((1, 3)).expectNext((4, 5)).expectComplete()
+      val probe =
+        Source(Range(1, 3))
+          .statefulMapAsync[Int, String](2)(() => Future { printThreadName("create"); 1 }, (s, e) => {
+            Future { s -> s"$e element" }
+          }, s => {
+            Some(s"$s state")
+          }, (x, y) => x + y)
+          .runWith(TestSink.probe)
+
+      val sub = probe.expectSubscription()
+      sub.request(1)
+      probe.expectNext("1 element")
+      sub.request(1)
+      probe.expectNext("2 element")
+      sub.request(1)
+      probe.expectNext("4 state")
+      probe.expectComplete()
     }
 
     "be able to restart" in {
@@ -234,7 +239,7 @@ class FlowStatefulMapSpec extends StreamSpec {
       Source
         .single(1)
         .statefulMap(() => -1)((_, elem) => {
-          throw ex
+//          throw ex
           (elem, elem)
         }, _ => {
           promise.complete(Success(Done))

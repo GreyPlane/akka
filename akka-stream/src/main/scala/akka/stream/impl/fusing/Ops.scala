@@ -4,32 +4,32 @@
 
 package akka.stream.impl.fusing
 
-import akka.actor.{ActorRef, Terminated}
-import akka.annotation.{DoNotInherit, InternalApi}
+import akka.actor.{ ActorRef, Terminated }
+import akka.annotation.{ DoNotInherit, InternalApi }
 import akka.event.Logging.LogLevel
 import akka.event._
 import akka.stream.ActorAttributes.SupervisionStrategy
-import akka.stream.Attributes.{InputBuffer, LogLevels, SourceLocation}
+import akka.stream.Attributes.{ InputBuffer, LogLevels, SourceLocation }
 import akka.stream.OverflowStrategies._
 import akka.stream.Supervision.Decider
 import akka.stream.impl.Stages.DefaultAttributes
 import akka.stream.impl.fusing.GraphStages.SimpleLinearGraphStage
-import akka.stream.impl.{ContextPropagation, ReactiveStreamsCompliance, Buffer => BufferImpl}
-import akka.stream.scaladsl.{DelayStrategy, Source}
+import akka.stream.impl.{ ContextPropagation, ReactiveStreamsCompliance, Buffer => BufferImpl }
+import akka.stream.scaladsl.{ DelayStrategy, Source }
 import akka.stream.stage._
 import akka.stream._
 import akka.util.ccompat._
-import akka.util.{OptionVal, unused}
+import akka.util.{ unused, OptionVal }
 
 import java.util.concurrent.TimeUnit.NANOSECONDS
-import scala.annotation.{nowarn, tailrec}
+import scala.annotation.{ nowarn, tailrec }
 import scala.collection.immutable
 import scala.collection.immutable.VectorBuilder
 import scala.concurrent.Future
-import scala.concurrent.duration.{FiniteDuration, _}
+import scala.concurrent.duration.{ FiniteDuration, _ }
 import scala.util.control.Exception.Catcher
-import scala.util.control.{NoStackTrace, NonFatal}
-import scala.util.{Failure, Success, Try}
+import scala.util.control.{ NoStackTrace, NonFatal }
+import scala.util.{ Failure, Success, Try }
 
 /**
  * INTERNAL API
@@ -409,8 +409,8 @@ private[stream] object Collect {
       private var aggregator = zero
       private lazy val decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
 
-      import Supervision.{Restart, Resume, Stop}
-      import shape.{in, out}
+      import Supervision.{ Restart, Resume, Stop }
+      import shape.{ in, out }
 
       // Initial behavior makes sure that the zero gets flushed if upstream is empty
       setHandler(out, new OutHandler {
@@ -1392,36 +1392,43 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       private val createCB = getAsyncCallback[Holder[S]](holder =>
         holder.elem match {
           case Success(_) => {
-//            stateAvailable = true
             needInvokeOnCompleteCallback = true
           }
           case Failure(ex) => failStage(ex)
         })
       private val stateHolder: Holder[S] = new Holder(NotYetThere, createCB)
       private var needInvokeOnCompleteCallback: Boolean = false
-//      private var stateAvailable = false
       var buffer: BufferImpl[Holder[(S, Out)]] = _
 
       private def releaseThenFailStage(ex: Throwable): Unit = {
         stateHolder.elem match {
-          case Failure(_)     => failStage(ex)
-          case Success(state) => onComplete(state).foreach(e => emit(out, e, () => failStage(ex)))
+          case Failure(_) => failStage(ex)
+          case Success(state) =>
+            onComplete(state).foreach(e => {
+              emit(out, e, () => failStage(ex))
+            })
         }
         needInvokeOnCompleteCallback = false
       }
 
       private def releaseThenCompleteStage(): Unit = {
         stateHolder.elem match {
-          case Failure(ex)    => failStage(ex)
-          case Success(state) => onComplete(state).fold(completeStage())(e => emit(out, e, () => completeStage()))
+          case Failure(ex) => failStage(ex)
+          case Success(state) => {
+            println("complete")
+            if (buffer.isEmpty) {
+              onComplete(state).fold(completeStage())(emit(out, _, () => completeStage()))
+            }
+          }
         }
         needInvokeOnCompleteCallback = false
       }
 
       private def getIfValuePresentOrFailFast[T](future: Future[T], holder: Holder[T], onSuccess: () => Unit): Unit = {
         future.value match {
-          case None    => future.onComplete(holder)(akka.dispatch.ExecutionContexts.parasitic)
+          case None => future.onComplete(holder)(akka.dispatch.ExecutionContexts.parasitic)
           case Some(v) =>
+            println(s"value already presented - $v")
             // #20217 the future is already here, optimization: avoid scheduling it on the dispatcher and
             // run the logic directly on this thread
             holder.setElem(v)
@@ -1444,7 +1451,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       override def onUpstreamFinish(): Unit = {
-        println("ss")
+        println("upstream finish")
         releaseThenCompleteStage()
       }
 
@@ -1463,7 +1470,6 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       override def preStart() = {
-        println("prestart")
         val futureState = create()
         getIfValuePresentOrFailFast(futureState, stateHolder, () => needInvokeOnCompleteCallback = true)
         buffer = BufferImpl(parallelism, inheritedAttributes)
@@ -1488,6 +1494,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
           case Failure(ex) => releaseThenFailStage(ex)
           case Success(state) => {
             try {
+              println(s"onPush ${state}")
               val future = f(state, grab(in))
               val holder = new Holder[(S, Out)](NotYetThere, futureCB)
               buffer.enqueue(holder)
@@ -1510,8 +1517,12 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
           holder.elem match {
             case Success(elem) =>
               if (elem != null) {
-                stateHolder.updateElemIfPresent(combineState(_, elem._1))
-                println(s"push ${elem._1}, ${stateHolder.elem}")
+                println(s"onPushNext ${elem}")
+                stateHolder.updateElemIfPresent(currState => {
+                  val combined = combineState(currState, elem._1)
+                  println(s"combined state: $combined")
+                  combined
+                })
                 push(out, elem._2)
                 pullIfNeeded()
               } else {
