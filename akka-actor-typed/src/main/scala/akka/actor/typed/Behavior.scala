@@ -229,6 +229,15 @@ object Behavior {
   def interpretMessage[T](behavior: Behavior[T], ctx: TypedActorContext[T], msg: T): Behavior[T] =
     interpret(behavior, ctx, msg, isSignal = false)
 
+  def forwardMessage[T](behavior: Behavior[T], ctx: TypedActorContext[T], msg: T): Behavior[T] = {
+    val interpreted = interpretMessage(behavior, ctx, msg)
+    (interpreted._tag: @switch) match {
+      case BehaviorTags.SameBehavior => behavior
+      case BehaviorTags.UnhandledBehavior => ctx.asScala.onUnhandled(msg); behavior
+      case _ => interpreted
+    }
+  }
+
   /**
    * Execute the behavior with the given signal.
    */
