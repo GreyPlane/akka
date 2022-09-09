@@ -21,7 +21,7 @@ class FlowStatefulMapAsyncSpec extends StreamSpec {
       .statefulMapAsync[Int, String](2)(
         () =>
           Future {
-            1
+            Thread.sleep(100); 1
           },
         (s, e) => {
           Future.successful(s -> s"$e element")
