@@ -1237,7 +1237,7 @@ private[stream] object Collect {
 private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
     create: () => Future[S],
     f: (S, In) => Future[(S, Out)],
-    onComplete: S => Option[Out],
+    release: S => Option[Out],
     combineState: (S, S) => S)
     extends GraphStage[FlowShape[In, Out]] {
 
@@ -1257,46 +1257,46 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
 
       lazy val decider: Decider = inheritedAttributes.mandatoryAttribute[SupervisionStrategy].decider
 
-      private val createCB = getAsyncCallback[Holder[S]](holder =>
-        holder.elem match {
-          case Success(_) => {
-            needInvokeOnCompleteCallback = true
-          }
-          case Failure(ex) => failStage(ex)
-        })
-      private val stateHolder: Holder[S] = new Holder(NotYetThere, createCB)
-      private var needInvokeOnCompleteCallback: Boolean = false
+      private def futureCB[R] =
+        getAsyncCallback[Holder[R]](holder =>
+          holder.elem match {
+            case Success(_) => pushNextIfPossible()
+            case Failure(ex) =>
+              holder.supervisionDirectiveFor(decider, ex) match {
+                // fail fast as if supervision says so
+                case Supervision.Stop    => failStage(ex)
+                case Supervision.Restart => resetStateAndPull()
+                case Supervision.Resume  => pushNextIfPossible()
+              }
+          })
+      private val stateHolder: Holder[S] = new Holder(NotYetThere, futureCB)
       var buffer: BufferImpl[Holder[(S, Out)]] = _
-      val ifNotPresentBuffer: BufferImpl[In] = BufferImpl(1, inheritedAttributes)
+      // buffer elem when it's arrived but state isn't present
+      var ifNotPresentBuffer: BufferImpl[In] = _
 
-      private def releaseThenFailStage(ex: Throwable): Unit = {
-        stateHolder.elem match {
-          case Failure(_) => failStage(ex)
-          case Success(state) =>
-            onComplete(state).foreach(e => {
-              emit(out, e, () => failStage(ex))
-            })
-        }
-        needInvokeOnCompleteCallback = false
-      }
+//      private def releaseThenFailStage(ex: Throwable): Unit = {
+//        stateHolder.elem match {
+//          case Failure(_) => failStage(ex)
+//          case Success(state) =>
+//            release(state).foreach(e => emit(out, e, () => failStage(ex)))
+//        }
+////        needInvokeOnCompleteCallback = false
+//      }
+//
+//      private def releaseThenCompleteStage(): Unit = {
+//        stateHolder.elem match {
+//          case Failure(ex) => failStage(ex)
+//          case Success(state) =>
+//            if (buffer.isEmpty) {
+//              release(state) match {
+//                case Some(value) => emit(out, value, () => completeStage())
+//                case None        => completeStage()
+//              }
+//            }
+//        }
+//      }
 
-      private def releaseThenCompleteStage(): Unit = {
-        stateHolder.elem match {
-          case Failure(ex) => failStage(ex)
-          case Success(state) => {
-            println("complete")
-            if (buffer.isEmpty) {
-              onComplete(state).fold(completeStage())(emit(out, _, () => completeStage()))
-            }
-          }
-        }
-        needInvokeOnCompleteCallback = false
-      }
-
-      private def getIfValuePresentOrFailFast[T](
-          future: Future[T],
-          holder: Holder[T],
-          onPresent: () => Unit): Unit = {
+      private def getIfValuePresentOrFailFast[T](future: Future[T], holder: Holder[T]): Unit = {
         future.value match {
           case None =>
             future.onComplete(holder)(akka.dispatch.ExecutionContexts.parasitic)
@@ -1308,73 +1308,54 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
             v match {
               // this optimization also requires us to stop the stage to fail fast if the decider says so:
               case Failure(ex) if holder.supervisionDirectiveFor(decider, ex) == Supervision.Stop =>
-                releaseThenFailStage(ex)
-              case _ => onPresent()
+                failStage(ex)
+              case _ => pushNextIfPossible()
             }
         }
       }
 
       private def resetStateAndPull(): Unit = {
-        needInvokeOnCompleteCallback = false
-        stateHolder.elem.foreach(onComplete)
-        getIfValuePresentOrFailFast(create(), stateHolder, () => {
-          needInvokeOnCompleteCallback = true
-        })
+        stateHolder.elem.foreach(release)
+        getIfValuePresentOrFailFast(create(), stateHolder)
       }
 
-      override def onUpstreamFinish(): Unit = {
-        println("upstream finish")
-        releaseThenCompleteStage()
-      }
-
-      override def onUpstreamFailure(ex: Throwable): Unit = releaseThenFailStage(ex)
-
-      override def onDownstreamFinish(cause: Throwable): Unit = {
-        stateHolder.elem.foreach(onComplete)
-        needInvokeOnCompleteCallback = false
-        super.onDownstreamFinish(cause)
-      }
+      override def onUpstreamFinish(): Unit =
+        if (stateHolder.elem != NotYetThere && buffer.isEmpty && ifNotPresentBuffer.isEmpty) {
+          completeStage()
+        }
 
       override def postStop(): Unit = {
-        if (needInvokeOnCompleteCallback) {
-          stateHolder.elem.foreach(onComplete)
+        println("stopped")
+        if (stateHolder.elem eq NotYetThere) {
+          // should do something since resource maybe in the half way of acquisition
+          ()
+        } else {
+          stateHolder.elem.foreach(release(_).foreach(emit(out, _)))
         }
       }
 
       override def preStart(): Unit = {
         val futureState = create()
-        getIfValuePresentOrFailFast(futureState, stateHolder, () => needInvokeOnCompleteCallback = true)
+        getIfValuePresentOrFailFast(futureState, stateHolder)
         buffer = BufferImpl(parallelism, inheritedAttributes)
+        ifNotPresentBuffer = BufferImpl(1, inheritedAttributes)
       }
-
-      private val futureCB = getAsyncCallback[Holder[(S, Out)]](holder =>
-        holder.elem match {
-          case Success(_) => pushNextIfPossible()
-          case Failure(ex) =>
-            holder.supervisionDirectiveFor(decider, ex) match {
-              // fail fast as if supervision says so
-              case Supervision.Stop    => releaseThenFailStage(ex)
-              case Supervision.Restart => resetStateAndPull()
-              case Supervision.Resume  => pushNextIfPossible()
-            }
-        })
 
       override def onPull(): Unit = pushNextIfPossible()
 
       private def applyF(elem: In): Unit = {
-        println("apply function")
         stateHolder.elem match {
-          case Failure(ex) => releaseThenFailStage(ex)
+          case Failure(ex) => failStage(ex)
           case Success(state) => {
             try {
               println(s"onPush ${state}")
               val future = f(state, elem)
               val holder = new Holder[(S, Out)](NotYetThere, futureCB)
               buffer.enqueue(holder)
-              getIfValuePresentOrFailFast(future, holder, () => pushNextIfPossible())
+              getIfValuePresentOrFailFast(future, holder)
             } catch {
               // this logic must only be executed if f throws, not if the future is failed
-              case NonFatal(ex) => if (decider(ex) == Supervision.Stop) releaseThenFailStage(ex)
+              case NonFatal(ex) => if (decider(ex) == Supervision.Stop) failStage(ex)
             }
             pullIfNeeded()
           }
@@ -1382,32 +1363,31 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       override def onPush(): Unit = {
-        println("onPush")
         if (stateHolder.elem eq NotYetThere) {
           // backpressure
-          println("backpressure")
           ifNotPresentBuffer.enqueue(grab(in))
-          pushNextIfPossible()
         } else applyF(grab(in))
       }
 
       @tailrec
       private def pushNextIfPossible(): Unit = {
-        if (stateHolder.elem eq NotYetThere) { println("not yet ready"); pushNextIfPossible() }
-        else if (ifNotPresentBuffer.isFull) { println("ready"); applyF(ifNotPresentBuffer.dequeue()) }
-        else if (buffer.isEmpty) pullIfNeeded()
+        if (stateHolder.elem eq NotYetThere) {
+          pushNextIfPossible()
+        } else if (ifNotPresentBuffer.isFull) {
+          applyF(ifNotPresentBuffer.dequeue())
+        } else if (buffer.isEmpty) pullIfNeeded()
         else if (buffer.peek().elem eq NotYetThere) pullIfNeeded() // ahead of line blocking to keep order
         else if (isAvailable(out)) {
           val holder = buffer.dequeue()
           holder.elem match {
             case Success(elem) =>
               if (elem != null) {
-                println(s"onPushNext ${elem}")
                 stateHolder.updateElemIfPresent(currState => {
                   val combined = combineState(currState, elem._1)
                   println(s"combined state: $combined")
                   combined
                 })
+                println(s"pushed ${elem._2}")
                 push(out, elem._2)
                 pullIfNeeded()
               } else {
@@ -1420,7 +1400,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
               holder.supervisionDirectiveFor(decider, ex) match {
                 // this could happen if we are looping in pushNextIfPossible and end up on a failed future before the
                 // onComplete callback has run
-                case Supervision.Stop => releaseThenFailStage(ex)
+                case Supervision.Stop => failStage(ex)
                 case _                =>
                   // try next element
                   pushNextIfPossible()
@@ -1433,8 +1413,9 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       private def pullIfNeeded(): Unit = {
-        println("what")
-        if (isClosed(in) && buffer.isEmpty) releaseThenCompleteStage()
+        // this will only be called after state future was completed
+        // so no need to check if state future is still pending or first element buffer is still full
+        if (isClosed(in) && buffer.isEmpty) completeStage()
         else if (buffer.used < parallelism && !hasBeenPulled(in)) tryPull(in)
         // else already pulled and waiting for next element
       }
