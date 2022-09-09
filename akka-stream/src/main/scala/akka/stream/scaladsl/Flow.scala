@@ -1030,6 +1030,13 @@ trait FlowOps[+Out, +Mat] {
   def statefulMap[S, T](create: () => S)(f: (S, Out) => (S, T), onComplete: S => Option[T]): Repr[T] =
     via(new StatefulMap[S, Out, T](create, f, onComplete))
 
+  def statefulMapAsync[S, T](parallelism: Int)(
+      create: () => Future[S],
+      f: (S, Out) => Future[(S, T)],
+      onComplete: S => Option[T],
+      combineState: (S, S) => S): Repr[T] =
+    via(new StatefulMapAsync[S, Out, T](parallelism)(create, f, onComplete, combineState))
+
   /**
    * Transform each input element into an `Iterable` of output elements that is
    * then flattened into the output stream. The transformation is meant to be stateful,

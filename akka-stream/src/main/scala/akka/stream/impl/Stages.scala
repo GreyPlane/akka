@@ -54,6 +54,7 @@ import akka.stream.Attributes._
     val batchWeighted = name("batchWeighted")
     val expand = name("expand")
     val statefulMap = name("statefulMap")
+    val statefulMapAsync = name("statefulMapAsync")
     val statefulMapConcat = name("statefulMapConcat")
     val detacher = name("detacher")
     val groupBy = name("groupBy")
