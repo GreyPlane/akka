@@ -7,6 +7,7 @@ package akka.stream.scaladsl
 import akka.stream.testkit.StreamSpec
 import akka.stream.testkit.scaladsl.TestSink
 
+import java.util.concurrent.ThreadLocalRandom
 import scala.concurrent.Future
 
 class FlowStatefulMapAsyncSpec extends StreamSpec {
@@ -21,13 +22,14 @@ class FlowStatefulMapAsyncSpec extends StreamSpec {
       .statefulMapAsync[Int, String](2)(
         () =>
           Future {
-            Thread.sleep(100); 1
+            Thread.sleep(ThreadLocalRandom.current().nextInt(1, 10))
+            1
           },
         (s, e) => {
           Future.successful(s -> s"$e element")
         },
         s => {
-          Some(s"$s state")
+          Future.successful(Some(s"$s state"))
         },
         (x, y) => x + y)
       .runWith(TestSink.probe)
@@ -62,7 +64,7 @@ class FlowStatefulMapAsyncSpec extends StreamSpec {
             }
           },
           s => {
-            Some(s"$s state")
+            Future.successful(Some(s"$s state"))
           },
           (x, y) => x + y)
         .runWith(TestSink.probe)
