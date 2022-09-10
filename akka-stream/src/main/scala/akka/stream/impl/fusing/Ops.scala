@@ -1449,7 +1449,6 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
               } else {
                 // elem is null
                 pullIfNeeded()
-                pushNextIfPossible()
               }
 
             case Failure(NonFatal(ex)) =>
