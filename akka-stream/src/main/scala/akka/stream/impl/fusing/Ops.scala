@@ -1234,10 +1234,12 @@ private[stream] object Collect {
   }
 }
 
+//TODO is there really need to impl future's optimization for create and release?
 private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
     create: () => Future[S],
+    //TODO (S, In) => (S, Future[Out]) seems more comfortable for user
     f: (S, In) => Future[(S, Out)],
-    release: S => Option[Out],
+    release: S => Future[Option[Out]],
     combineState: (S, S) => S)
     extends GraphStage[FlowShape[In, Out]] {
 
@@ -1264,44 +1266,102 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
             case Failure(ex) =>
               holder.supervisionDirectiveFor(decider, ex) match {
                 // fail fast as if supervision says so
-                case Supervision.Stop    => failStage(ex)
+                case Supervision.Stop    => releaseThenFailStage(ex)
                 case Supervision.Restart => resetStateAndPull()
                 case Supervision.Resume  => pushNextIfPossible()
               }
           })
+      private val releaseCB = getAsyncCallback[(Option[Throwable], Try[Option[Out]])]((tryEmit _).tupled).invoke _
+      private var notReleased: Boolean = true
       private val stateHolder: Holder[S] = new Holder(NotYetThere, futureCB)
       var buffer: BufferImpl[Holder[(S, Out)]] = _
       // buffer elem when it's arrived but state isn't present
       var ifNotPresentBuffer: BufferImpl[In] = _
 
-//      private def releaseThenFailStage(ex: Throwable): Unit = {
-//        stateHolder.elem match {
-//          case Failure(_) => failStage(ex)
-//          case Success(state) =>
-//            release(state).foreach(e => emit(out, e, () => failStage(ex)))
-//        }
-////        needInvokeOnCompleteCallback = false
-//      }
-//
-//      private def releaseThenCompleteStage(): Unit = {
-//        stateHolder.elem match {
-//          case Failure(ex) => failStage(ex)
-//          case Success(state) =>
-//            if (buffer.isEmpty) {
-//              release(state) match {
-//                case Some(value) => emit(out, value, () => completeStage())
-//                case None        => completeStage()
-//              }
-//            }
-//        }
-//      }
+      private def failedOrCompleteStage(exOpt: Option[Throwable]): Unit = exOpt match {
+        case Some(ex) => failStage(ex)
+        case None     => completeStage()
+      }
 
-      private def getIfValuePresentOrFailFast[T](future: Future[T], holder: Holder[T]): Unit = {
+      private def tryEmit(ex: Option[Throwable], result: Try[Option[Out]]): Unit = result match {
+        case Success(elemOpt) =>
+          elemOpt match {
+            case Some(elem) => emit(out, elem, () => failedOrCompleteStage(ex))
+            case None       => failedOrCompleteStage(ex)
+          }
+        case Failure(releaseEx) => failStage(releaseEx)
+      }
+
+      @tailrec
+      private def releaseThenFailStage(ex: Throwable): Unit = {
+        if (stateHolder.elem eq NotYetThere) {
+          releaseThenFailStage(ex)
+        } else if (notReleased) {
+          stateHolder.elem match {
+            // since outer decider already said to stop
+            case Failure(_) => failStage(ex)
+            case Success(state) =>
+              notReleased = false
+              try {
+                val future = release(state)
+                future.value match {
+                  case None =>
+                    future.onComplete(v => releaseCB(Some(ex) -> v))(akka.dispatch.ExecutionContexts.parasitic)
+                  case Some(v) =>
+                    tryEmit(Some(ex), v)
+                }
+              } catch {
+                // ideally should never throw when release resource
+                case NonFatal(e) => failStage(e)
+              }
+          }
+        }
+      }
+
+      @tailrec
+      private def releaseThenCompleteStage(): Unit = {
+        if (stateHolder.elem eq NotYetThere) {
+          releaseThenCompleteStage()
+        } else if (notReleased) {
+          stateHolder.elem match {
+            // since outer decider already said to stop
+            case Failure(_) => completeStage()
+            case Success(state) =>
+              notReleased = false
+              try {
+                val future = release(state)
+                future.value match {
+                  case None =>
+                    future.onComplete(v => releaseCB(None -> v))(akka.dispatch.ExecutionContexts.parasitic)
+                  case Some(v) =>
+                    tryEmit(None, v)
+                }
+              } catch {
+                // ideally should never throw when release resource
+                case NonFatal(e) => failStage(e)
+              }
+          }
+        }
+      }
+
+      override def onUpstreamFinish(): Unit =
+        if ((stateHolder.elem ne NotYetThere) && buffer.isEmpty && ifNotPresentBuffer.isEmpty) {
+          releaseThenCompleteStage()
+        }
+
+      override def onUpstreamFailure(ex: Throwable): Unit = if (stateHolder.elem ne NotYetThere) {
+        releaseThenFailStage(ex)
+      }
+
+      override def onDownstreamFinish(cause: Throwable): Unit = if (stateHolder.elem ne NotYetThere) {
+        releaseThenFailStage(cause)
+      }
+
+      private def tryAvoidScheduling[T](future: Future[T], holder: Holder[T]): Unit = {
         future.value match {
           case None =>
             future.onComplete(holder)(akka.dispatch.ExecutionContexts.parasitic)
           case Some(v) =>
-            println(s"value already presented - $v")
             // #20217 the future is already here, optimization: avoid scheduling it on the dispatcher and
             // run the logic directly on this thread
             holder.setElem(v)
@@ -1316,27 +1376,25 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
 
       private def resetStateAndPull(): Unit = {
         stateHolder.elem.foreach(release)
-        getIfValuePresentOrFailFast(create(), stateHolder)
+        tryAvoidScheduling(create(), stateHolder)
       }
-
-      override def onUpstreamFinish(): Unit =
-        if (stateHolder.elem != NotYetThere && buffer.isEmpty && ifNotPresentBuffer.isEmpty) {
-          completeStage()
-        }
 
       override def postStop(): Unit = {
         println("stopped")
         if (stateHolder.elem eq NotYetThere) {
-          // should do something since resource maybe in the half way of acquisition
+          //TODO figure out what should be done here
+          // since resource maybe in the half way of acquisition
           ()
         } else {
-          stateHolder.elem.foreach(release(_).foreach(emit(out, _)))
+          // Outlet isn't available here
+          println(isAvailable(out))
+          stateHolder.elem.foreach(release(_))
         }
       }
 
       override def preStart(): Unit = {
         val futureState = create()
-        getIfValuePresentOrFailFast(futureState, stateHolder)
+        tryAvoidScheduling(futureState, stateHolder)
         buffer = BufferImpl(parallelism, inheritedAttributes)
         ifNotPresentBuffer = BufferImpl(1, inheritedAttributes)
       }
@@ -1352,7 +1410,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
               val future = f(state, elem)
               val holder = new Holder[(S, Out)](NotYetThere, futureCB)
               buffer.enqueue(holder)
-              getIfValuePresentOrFailFast(future, holder)
+              tryAvoidScheduling(future, holder)
             } catch {
               // this logic must only be executed if f throws, not if the future is failed
               case NonFatal(ex) => if (decider(ex) == Supervision.Stop) failStage(ex)
@@ -1371,11 +1429,9 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
 
       @tailrec
       private def pushNextIfPossible(): Unit = {
-        if (stateHolder.elem eq NotYetThere) {
-          pushNextIfPossible()
-        } else if (ifNotPresentBuffer.isFull) {
-          applyF(ifNotPresentBuffer.dequeue())
-        } else if (buffer.isEmpty) pullIfNeeded()
+        if (stateHolder.elem eq NotYetThere) pushNextIfPossible()
+        else if (ifNotPresentBuffer.isFull) applyF(ifNotPresentBuffer.dequeue())
+        else if (buffer.isEmpty) pullIfNeeded()
         else if (buffer.peek().elem eq NotYetThere) pullIfNeeded() // ahead of line blocking to keep order
         else if (isAvailable(out)) {
           val holder = buffer.dequeue()
@@ -1415,7 +1471,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       private def pullIfNeeded(): Unit = {
         // this will only be called after state future was completed
         // so no need to check if state future is still pending or first element buffer is still full
-        if (isClosed(in) && buffer.isEmpty) completeStage()
+        if (isClosed(in) && buffer.isEmpty) releaseThenCompleteStage()
         else if (buffer.used < parallelism && !hasBeenPulled(in)) tryPull(in)
         // else already pulled and waiting for next element
       }

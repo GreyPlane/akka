@@ -1033,7 +1033,7 @@ trait FlowOps[+Out, +Mat] {
   def statefulMapAsync[S, T](parallelism: Int)(
       create: () => Future[S],
       f: (S, Out) => Future[(S, T)],
-      onComplete: S => Option[T],
+      onComplete: S => Future[Option[T]],
       combineState: (S, S) => S): Repr[T] =
     via(new StatefulMapAsync[S, Out, T](parallelism)(create, f, onComplete, combineState))
 
