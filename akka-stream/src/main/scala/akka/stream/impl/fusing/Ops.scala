@@ -1424,7 +1424,11 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
         if (stateHolder.elem eq NotYetThere) {
           // backpressure
           ifNotPresentBuffer.enqueue(grab(in))
-        } else applyF(grab(in))
+          pushNextIfPossible()
+        } else {
+          applyF(grab(in))
+          pullIfNeeded()
+        }
       }
 
       @tailrec
@@ -1449,6 +1453,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
               } else {
                 // elem is null
                 pullIfNeeded()
+                pushNextIfPossible()
               }
 
             case Failure(NonFatal(ex)) =>
@@ -1471,7 +1476,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
         // this will only be called after state future was completed
         // so no need to check if state future is still pending or first element buffer is still full
         if (isClosed(in) && buffer.isEmpty) releaseThenCompleteStage()
-        else if (buffer.used < parallelism && !hasBeenPulled(in)) tryPull(in)
+        else if (buffer.used < parallelism && ifNotPresentBuffer.isEmpty && !hasBeenPulled(in)) tryPull(in)
         // else already pulled and waiting for next element
       }
 
