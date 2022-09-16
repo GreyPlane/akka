@@ -1679,8 +1679,9 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
 
       private var inFlight = 0
       private var buffer: BufferImpl[Out] = _
+      private val invokeFutureCB: Try[Out] => Unit = getAsyncCallback(futureCompleted).invoke
 
-      private[this] def todo = inFlight + buffer.used
+      private[this] def todo: Int = inFlight + buffer.used
 
       override def preStart(): Unit = buffer = BufferImpl(parallelism, inheritedAttributes)
 
@@ -1703,9 +1704,6 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
             else if (!hasBeenPulled(in)) tryPull(in)
         }
       }
-
-      private val futureCB = getAsyncCallback(futureCompleted)
-      private val invokeFutureCB: Try[Out] => Unit = futureCB.invoke
 
       override def onPush(): Unit = {
         try {
