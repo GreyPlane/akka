@@ -1261,7 +1261,9 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       private val createCB =
         getAsyncCallback[Try[S]] {
           case Failure(e) => failStage(e)
-          case Success(s) => state = Some(s)
+          case Success(s) =>
+            state = Some(s)
+            if (needDriven) pushNextIfPossible()
         }.invokeWithFeedback _
 
       private val futureCB =
@@ -1278,6 +1280,7 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
           })
       private val releaseCB = getAsyncCallback[(Option[Throwable], Try[Option[Out]])]((tryEmit _).tupled).invoke _
       private var notReleased: Boolean = true
+      private var needDriven: Boolean = false
       private var state: Option[S] = None
       var buffer: BufferImpl[Holder[(S, Out)]] = _
       // buffer elem when it's arrived but state isn't present
@@ -1386,10 +1389,8 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       override def postStop(): Unit = {
-        println("stopped")
         state match {
           case Some(value) =>
-            println(isAvailable(out))
             // outlet isn't available here
             if (notReleased) onComplete(value)
           //TODO figure out what should be done here
@@ -1426,7 +1427,6 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
 
       private def applyF(elem: In): Unit = {
         try {
-          println(s"onPush ${state} ${elem}")
           val future = f(state.get, elem)
           val holder = new Holder[(S, Out)](NotYetThere, futureCB)
           buffer.enqueue(holder)
@@ -1439,30 +1439,37 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
       }
 
       override def onPush(): Unit = {
+        val elem = grab(in)
+//        println(s"pulled  $elem")
         state match {
           case Some(_) =>
-            applyF(grab(in))
+            applyF(elem)
             pullIfNeeded()
           case None =>
-            ifNotPresentBuffer.enqueue(grab(in))
-            pullIfNeeded()
+            ifNotPresentBuffer.enqueue(elem)
+            pushNextIfPossible()
         }
       }
 
       @tailrec
       private def pushNextIfPossible(): Unit = {
-        if (state.isEmpty) ()
-        else if (ifNotPresentBuffer.isFull) applyF(ifNotPresentBuffer.dequeue())
-        else if (buffer.isEmpty) pullIfNeeded()
-        else if (buffer.peek().elem eq NotYetThere) pullIfNeeded() // ahead of line blocking to keep order
+        if (state.isEmpty) {
+          needDriven = true
+        } else if (ifNotPresentBuffer.isFull) {
+          applyF(ifNotPresentBuffer.dequeue())
+        } else if (buffer.isEmpty) {
+          pullIfNeeded()
+        } else if (buffer.peek().elem eq NotYetThere) {
+          pullIfNeeded()
+        } // ahead of line blocking to keep order
         else if (isAvailable(out)) {
           val holder = buffer.dequeue()
           holder.elem match {
             case Success(elem) =>
+              println(s"available $elem ${Thread.currentThread().getName}")
               if (elem != null && elem._1 != null && elem._2 != null) {
                 // state has to be presented here
                 state = Some(combineState(state.get, elem._1))
-                println(s"pushed ${elem._2}")
                 push(out, elem._2)
                 pullIfNeeded()
               } else {
@@ -1484,6 +1491,8 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
               // fatal exception in buffer, not sure that it can actually happen, but for good measure
               throw ex
           }
+        } else {
+          println(s"unavailable ${Thread.currentThread().getName}")
         }
       }
 
@@ -1570,7 +1579,9 @@ private[akka] final case class StatefulMapAsync[S, In, Out](parallelism: Int)(
             }
         })
 
-      override def preStart(): Unit = buffer = BufferImpl(parallelism, inheritedAttributes)
+      override def preStart(): Unit = {
+        buffer = BufferImpl(parallelism, inheritedAttributes)
+      }
 
       override def onPull(): Unit = pushNextIfPossible()
 
