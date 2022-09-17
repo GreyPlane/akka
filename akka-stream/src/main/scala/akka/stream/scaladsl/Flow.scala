@@ -1139,7 +1139,13 @@ trait FlowOps[+Out, +Mat] {
    */
   def mapAsync[T](parallelism: Int)(f: Out => Future[T]): Repr[T] =
     if (parallelism == 1) mapAsyncUnordered[T](parallelism = 1)(f) // optimization for parallelism 1
-    else via(MapAsync(parallelism, f))
+    else
+//      via(MapAsync(parallelism, f))
+      statefulMapAsync[Unit, T](parallelism)(
+        () => Future.unit,
+        (_: Unit, out) => f(out).map(() -> _)(akka.dispatch.ExecutionContexts.parasitic),
+        (_: Unit) => Future.successful(None),
+        (_, _) => ())
 
   /**
    * Transform this stream by applying the given function to each of the elements

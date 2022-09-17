@@ -18,21 +18,27 @@ class FlowStatefulMapAsyncSpec extends StreamSpec {
 
     implicit val ec = system.dispatcher
 
-    val probe = Source(Range(1, 3))
-      .statefulMapAsync[Int, String](2)(
-        () =>
-          Future {
-            Thread.sleep(ThreadLocalRandom.current().nextInt(1, 10))
-            1
-          },
-        (s, e) => {
-          Future.successful(s -> s"$e element")
+    val statefulMapSource = Source(Range(1, 3)).statefulMapAsync[Int, String](2)(
+      () =>
+        Future {
+          Thread.sleep(ThreadLocalRandom.current().nextInt(1, 10))
+          1
         },
-        s => {
-          Future.successful(Some(s"$s state"))
-        },
-        (x, y) => x + y)
-      .runWith(TestSink.probe)
+      (s, e) => {
+        Future.successful(s -> s"$e element")
+      },
+      s => {
+        Future.successful(Some(s"$s state"))
+      },
+      (x, y) => x + y)
+
+    println(statefulMapSource.toString)
+
+    val mapSource = Source(Range(1, 3)).mapAsync(2)(x => Future.successful(s"$x element"))
+
+    println(mapSource.toString)
+
+    val probe = statefulMapSource.runWith(TestSink())
 
     val sub = probe.expectSubscription()
     sub.request(1)
@@ -67,7 +73,7 @@ class FlowStatefulMapAsyncSpec extends StreamSpec {
             Future.successful(Some(s"$s state"))
           },
           (x, y) => x + y)
-        .runWith(TestSink.probe)
+        .runWith(TestSink())
 
     val sub = probe.expectSubscription()
     sub.request(1)
